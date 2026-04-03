@@ -32,9 +32,11 @@ public class ApkSpy {
 	private static final Logger LOG = LoggerFactory.getLogger(ApkSpy.class);
 
 	private static String getClasspath(String... libs) {
-		return Arrays.stream(libs)
-				.map(lib -> lib.startsWith("/") ? lib : String.join(File.separator, "..", "libs", lib))
-				.collect(Collectors.joining(File.pathSeparator));
+	    return Arrays.stream(libs)
+	            .map(lib -> new File(lib).isAbsolute()
+	                    ? lib
+	                    : String.join(File.separator, "..", "libs", lib))
+	            .collect(Collectors.joining(File.pathSeparator));
 	}
 
 	private static String findLatestAndroidJars(final String sdkPath) {
