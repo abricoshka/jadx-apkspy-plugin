@@ -16,6 +16,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.apache.commons.io.FileUtils;
 import org.slf4j.Logger;
@@ -32,9 +34,25 @@ public class ApkSpy {
 	private static final Logger LOG = LoggerFactory.getLogger(ApkSpy.class);
 
 	private static String getClasspath(String... libs) {
-		return Arrays.stream(libs)
-				.map(lib -> lib.startsWith("/") ? lib : String.join(File.separator, "..", "libs", lib))
-				.collect(Collectors.joining(File.pathSeparator));
+	    return Arrays.stream(libs)
+	            .map(lib -> new File(lib).isAbsolute()
+	                    ? lib
+	                    : String.join(File.separator, "..", "libs", lib))
+	            .collect(Collectors.joining(File.pathSeparator));
+	}
+
+	private static String findDeclaredTypeName(String src) {
+	    Matcher m = Pattern.compile("\\bpublic\\s+(?:class|interface|enum|@interface)\\s+(\\w+)\\b").matcher(src);
+	    if (m.find()) {
+	        return m.group(1);
+	    }
+	
+	    m = Pattern.compile("\\b(?:class|interface|enum|@interface)\\s+(\\w+)\\b").matcher(src);
+	    if (m.find()) {
+	        return m.group(1);
+	    }
+	
+	    throw new IllegalStateException("Could not determine declared type name");
 	}
 
 	private static String findLatestAndroidJars(final String sdkPath) {
@@ -69,13 +87,15 @@ public class ApkSpy {
 
 		Util.attemptDelete(root.toFile());
 
+		String source = content.toString();
 		String pkg = className.substring(0, className.lastIndexOf('.'));
+		String declaredType = findDeclaredTypeName(source);
+		
 		Path folder = root.resolve(Paths.get("src", pkg.replace('.', File.separatorChar)));
-		if (!Files.isDirectory(folder)) {
-			Files.createDirectories(folder);
-		}
-		Files.write(root.resolve(Paths.get("src", className.replace('.', File.separatorChar) + ".java")),
-				content.toString().getBytes(StandardCharsets.UTF_8));
+		Files.createDirectories(folder);
+		
+		Path file = folder.resolve(declaredType + ".java");
+		Files.writeString(file, source, StandardCharsets.UTF_8);
 
 		Path stubPath = Paths.get(System.getProperty("java.io.tmpdir"), "apkSpy",
 				modifyingApk.getName().replace('.', '_') + "stub.jar");
@@ -111,7 +131,7 @@ public class ApkSpy {
 				getClasspath(targetVersionDir + File.separator + "android.jar", "stub.jar",
 						targetVersionDir + File.separator + "optional" + File.separator + "org.apache.http.legacy.jar"),
 				"-d",
-				".." + File.separator + "bin", className.replace('.', File.separatorChar) + ".java");
+				".." + File.separator + "bin", pkg.replace('.', File.separatorChar) + File.separator + declaredType + ".java");
 
 		Util.attemptDelete(root.toFile());
 
