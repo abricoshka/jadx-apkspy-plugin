@@ -41,8 +41,15 @@ public class JarGenerator {
 			throws IOException, InterruptedException {
 		Util.attemptDelete(new File("decompiled-apk"));
 
-		Dex2jarCmd.main("-nc", "-o",
-				output.getAbsolutePath(), apk.getAbsolutePath());
+		try {
+		    Dex2jarCmd.main("-nc", "-o", output.getAbsolutePath(), apk.getAbsolutePath());
+		} catch (Throwable t) {
+		    throw new IOException("dex2jar failed before creating stub jar: " + output.getAbsolutePath(), t);
+		}
+		
+		if (!output.exists()) {
+		    throw new IOException("dex2jar did not create stub jar: " + output.getAbsolutePath());
+		}
 
 		Path tmpDir = Paths.get(System.getProperty("java.io.tmpdir"), "apkSpy", "dex2jar-classes");
 		Util.attemptDelete(tmpDir.toFile());
