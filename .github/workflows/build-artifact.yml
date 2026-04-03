@@ -1,0 +1,47 @@
+name: Build Artifact
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-artifact:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Build distributable jar
+        run: ./gradlew --no-daemon clean dist
+
+      - name: Show build outputs
+        run: |
+          echo "Contents of build/dist:"
+          ls -la build/dist || true
+          echo
+          echo "Contents of build/libs:"
+          ls -la build/libs || true
+
+      - name: Upload plugin jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: jadx-apkspy-plugin
+          path: build/dist/*.jar
+          if-no-files-found: error
+          retention-days: 30
