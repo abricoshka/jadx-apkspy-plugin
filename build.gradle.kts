@@ -94,6 +94,7 @@ tasks {
 	val shadowJar =
 		withType(ShadowJar::class) {
 			archiveClassifier.set("") // remove '-all' suffix
+            mergeServiceFiles()
 		}
 
 	// copy result jar into "build/dist" directory

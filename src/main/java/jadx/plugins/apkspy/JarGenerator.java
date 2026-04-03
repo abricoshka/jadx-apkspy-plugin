@@ -4,6 +4,8 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -14,6 +16,7 @@ import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
+import java.nio.charset.StandardCharsets;
 
 import org.apache.commons.io.FileUtils;
 import org.objectweb.asm.ClassReader;
@@ -38,17 +41,43 @@ public class JarGenerator {
 	private static final Logger LOG = LoggerFactory.getLogger(JarGenerator.class);
 
 	public static void generateStubJar(File apk, File output, OutputStream out, Map<String, ClassBreakdown> classes)
-			throws IOException, InterruptedException {
-		Util.attemptDelete(new File("decompiled-apk"));
-
-		Dex2jarCmd.main("-nc", "-o",
-				output.getAbsolutePath(), apk.getAbsolutePath());
-
-		Path tmpDir = Paths.get(System.getProperty("java.io.tmpdir"), "apkSpy", "dex2jar-classes");
-		Util.attemptDelete(tmpDir.toFile());
-		Files.createDirectories(tmpDir);
-
-		JarFile jarFile = new JarFile(output);
+	        throws IOException, InterruptedException {
+	
+	    Util.attemptDelete(new File("decompiled-apk"));
+	
+	    ByteArrayOutputStream dex2jarErr = new ByteArrayOutputStream();
+	    PrintStream oldErr = System.err;
+	
+	    try (PrintStream captureErr = new PrintStream(dex2jarErr, true, StandardCharsets.UTF_8)) {
+	        System.setErr(captureErr);
+	
+	        Dex2jarCmd.main(
+	                "-f",
+	                "-nc",
+	                "-o", output.getAbsolutePath(),
+	                apk.getAbsolutePath()
+	        );
+	    } finally {
+	        System.setErr(oldErr);
+	    }
+	
+	    if (!output.exists()) {
+	        String errText = dex2jarErr.toString(StandardCharsets.UTF_8);
+	        if (errText.isBlank()) {
+	            throw new IOException("dex2jar did not create stub jar: " + output.getAbsolutePath());
+	        }
+	        throw new IOException(
+	                "dex2jar did not create stub jar: " + output.getAbsolutePath()
+	                        + "\n--- dex2jar stderr ---\n"
+	                        + errText
+	        );
+	    }
+	
+	    Path tmpDir = Paths.get(System.getProperty("java.io.tmpdir"), "apkSpy", "dex2jar-classes");
+	    Util.attemptDelete(tmpDir.toFile());
+	    Files.createDirectories(tmpDir);
+	
+	    JarFile jarFile = new JarFile(output);
 		Enumeration<JarEntry> entries = jarFile.entries();
 		while (entries.hasMoreElements()) {
 			JarEntry entry = entries.nextElement();
