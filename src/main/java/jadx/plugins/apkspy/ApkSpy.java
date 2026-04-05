@@ -4,6 +4,8 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -16,9 +18,14 @@ import java.util.Collections;
 import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
@@ -39,6 +46,10 @@ public class ApkSpy {
 
 	private static final Logger LOG = LoggerFactory.getLogger(ApkSpy.class);
 	private static final String STUB_CACHE_VERSION = "apkspy-stub-v5";
+	private static final int MAX_DIAGNOSTIC_PATHS = 20;
+	private static final int FILE_PROGRESS_LOG_INTERVAL = 100;
+	private static final long FILE_PROGRESS_HEARTBEAT_MS = TimeUnit.SECONDS.toMillis(5);
+	private static final long POST_PROCESS_HEARTBEAT_MS = TimeUnit.SECONDS.toMillis(10);
 
 	private static String getClasspath(String... libs) {
 	    return Arrays.stream(libs)
@@ -86,8 +97,22 @@ public class ApkSpy {
 	}
 
 	private static void writeLine(OutputStream out, String message) throws IOException {
-		out.write(message.getBytes(StandardCharsets.UTF_8));
-		out.write('\n');
+		synchronized (out) {
+			out.write(message.getBytes(StandardCharsets.UTF_8));
+			out.write('\n');
+			out.flush();
+		}
+	}
+
+	private static void writeException(OutputStream out, String stage, Throwable throwable) throws IOException {
+		writeLine(out, "[ApkSpy] ERROR during " + stage + ": " + throwable);
+		StringWriter writer = new StringWriter();
+		throwable.printStackTrace(new PrintWriter(writer));
+		for (String line : writer.toString().split("\\r?\\n")) {
+			if (!line.isEmpty()) {
+				writeLine(out, "[ApkSpy]   " + line);
+			}
+		}
 	}
 
 	private static Set<String> toJarEntries(Set<String> classNames) {
@@ -225,6 +250,15 @@ public class ApkSpy {
 		return className.contains(".") ? className.substring(0, className.lastIndexOf('.')) : "";
 	}
 
+	static RebuildStrategy selectRebuildStrategy(Map<String, ClassBreakdown> ignoredClasses) {
+		return RebuildStrategy.SMALI_ONLY_NO_RES;
+	}
+
+	private static void logRebuildStrategy(RebuildStrategy strategy, OutputStream out) throws IOException {
+		writeLine(out, "[ApkSpy] rebuild strategy: " + strategy.getId());
+		writeLine(out, "[ApkSpy] rebuild strategy reason: " + strategy.getDescription());
+	}
+
 	private static void configureBuildGradle(Path gradleBuildPath, String applicationId,
 			Map<String, ClassBreakdown> classes, OutputStream out) throws IOException {
 		String buildGradle = Files.readString(gradleBuildPath, StandardCharsets.UTF_8);
@@ -291,31 +325,315 @@ public class ApkSpy {
 		}
 	}
 
-	private static Map<String, Path> indexSmaliFiles(List<Path> roots) throws IOException {
+	static Map<String, Path> indexSmaliFiles(List<Path> roots, String label, OutputStream out,
+			PostProcessHeartbeat heartbeat) throws IOException {
 		Map<String, Path> index = new HashMap<>();
+		Set<Path> visitedRoots = new HashSet<>();
+		int processed = 0;
+		int indexed = 0;
+		long lastProgressLogAt = System.nanoTime();
+
+		writeLine(out, "[ApkSpy] indexing " + label + " smali files from " + roots.size() + " root(s)");
 		for (Path root : roots) {
-			try (var paths = Files.walk(root)) {
-				List<Path> smaliFiles = paths
+			if (root == null) {
+				writeLine(out, "[ApkSpy] skip missing " + label + " root: (null)");
+				continue;
+			}
+			if (!Files.exists(root)) {
+				writeLine(out, "[ApkSpy] skip missing " + label + " root: " + root.toAbsolutePath());
+				continue;
+			}
+			Path normalizedRoot = toCanonicalOrAbsolutePath(root);
+			if (!visitedRoots.add(normalizedRoot)) {
+				writeLine(out, "[ApkSpy] Skipping duplicate smali root for " + label + ": "
+						+ normalizedRoot.toAbsolutePath());
+				continue;
+			}
+			writeLine(out, "[ApkSpy] indexing " + label + " root: " + normalizedRoot.toAbsolutePath());
+			heartbeat.setStage("index " + label + " smali");
+			heartbeat.setItem(normalizedRoot.toAbsolutePath().toString());
+			try (var paths = Files.walk(normalizedRoot)) {
+				var iterator = paths
 						.filter(path -> Files.isRegularFile(path) && path.getFileName().toString().endsWith(".smali"))
-						.collect(Collectors.toList());
-				for (Path smaliFile : smaliFiles) {
+						.iterator();
+				while (iterator.hasNext()) {
+					Path smaliFile = iterator.next();
+					heartbeat.setItem(smaliFile.toAbsolutePath().toString());
+					processed++;
 					String content = Files.readString(smaliFile, StandardCharsets.UTF_8);
 					String className = SmaliBreakdown.breakdown(content).getClassName();
 					if (!className.isEmpty()) {
 						index.putIfAbsent(className, smaliFile);
+						indexed++;
+					}
+					long now = System.nanoTime();
+					if (processed % FILE_PROGRESS_LOG_INTERVAL == 0
+							|| TimeUnit.NANOSECONDS.toMillis(now - lastProgressLogAt) >= FILE_PROGRESS_HEARTBEAT_MS) {
+						writeLine(out, "[ApkSpy] indexing " + label + " progress: processed=" + processed
+								+ ", indexed=" + indexed + ", current=" + smaliFile.toAbsolutePath());
+						lastProgressLogAt = now;
 					}
 				}
 			}
 		}
+		writeLine(out, "[ApkSpy] finished indexing " + label + " smali files: processed=" + processed
+				+ ", indexed=" + indexed);
 		return index;
 	}
 
-	private static Map<Path, Path> mapGeneratedToOriginalRoots(List<Path> generatedRoots) {
-		Map<Path, Path> rootMap = new HashMap<>();
+	static Map<Path, Path> mapGeneratedToOriginalRoots(List<Path> generatedRoots, OutputStream out) throws IOException {
+		Map<Path, Path> rootMap = new LinkedHashMap<>();
 		for (Path generatedRoot : generatedRoots) {
-			rootMap.put(generatedRoot, Paths.get(generatedRoot.toString().replace("generated", "original")));
+			Path originalRoot = Paths.get(generatedRoot.toString().replace("generated", "original"));
+			rootMap.put(generatedRoot, originalRoot);
+			writeLine(out, "[ApkSpy] original root "
+					+ (Files.isDirectory(originalRoot) ? "exists" : "missing")
+					+ ": " + originalRoot.toAbsolutePath());
 		}
 		return rootMap;
+	}
+
+	private static List<Path> collectExistingRoots(Map<Path, Path> rootMap) {
+		return rootMap.values().stream()
+				.filter(path -> path != null && Files.isDirectory(path))
+				.collect(Collectors.toList());
+	}
+
+	static UnknownFilesSnapshot collectUnknownFiles(Path decodeRoot) throws IOException {
+		Map<String, Path> filesByApkPath = new LinkedHashMap<>();
+		Path normalizedDecodeRoot = toCanonicalOrAbsolutePath(decodeRoot);
+		Path unknownRoot = normalizedDecodeRoot.resolve("unknown");
+		if (Files.isDirectory(unknownRoot)) {
+			try (var paths = Files.walk(unknownRoot)) {
+				for (Path file : paths.filter(Files::isRegularFile).collect(Collectors.toList())) {
+					String apkPath = normalizeRelativePath(unknownRoot.relativize(file));
+					filesByApkPath.put(apkPath, file);
+				}
+			}
+		}
+
+		Map<String, String> apktoolMappings = new LinkedHashMap<>();
+		Path apktoolYml = normalizedDecodeRoot.resolve("apktool.yml");
+		if (Files.exists(apktoolYml)) {
+			apktoolMappings.putAll(parseUnknownFilesSection(Files.readString(apktoolYml, StandardCharsets.UTF_8)));
+		}
+		return new UnknownFilesSnapshot(normalizedDecodeRoot, filesByApkPath, apktoolMappings);
+	}
+
+	private static void logUnknownFiles(String stage, UnknownFilesSnapshot snapshot, OutputStream out) throws IOException {
+		writeLine(out, "[ApkSpy] " + stage + " decode root: " + snapshot.getDecodeRoot().toAbsolutePath());
+		writeLine(out, "[ApkSpy] after collect " + stage + " unknown files: fileCount="
+				+ snapshot.getFilesByApkPath().size() + ", mappingCount=" + snapshot.getApktoolMappings().size());
+		writeLine(out, "[ApkSpy] " + stage + " unknown files: "
+				+ formatDiagnosticPaths(snapshot.getFilesByApkPath().keySet()));
+		writeLine(out, "[ApkSpy] " + stage + " apktool.yml unknownFiles: "
+				+ formatDiagnosticPaths(snapshot.getApktoolMappings().keySet()));
+	}
+
+	static void mergeUnknownFiles(UnknownFilesSnapshot generatedUnknown, Path originalRoot,
+			UnknownFilesSnapshot originalUnknown, OutputStream out, PostProcessHeartbeat heartbeat) throws IOException {
+		writeLine(out, "[ApkSpy] before unknown files merge/copy");
+		int copied = 0;
+		int skipped = 0;
+		int processed = 0;
+		long lastProgressLogAt = System.nanoTime();
+
+		for (Map.Entry<String, Path> generatedEntry : generatedUnknown.getFilesByApkPath().entrySet()) {
+			String apkPath = generatedEntry.getKey();
+			Path source = generatedEntry.getValue();
+			Path destination = originalRoot.resolve("unknown").resolve(apkPath.replace('/', java.io.File.separatorChar));
+			heartbeat.setStage("unknown files merge/copy");
+			heartbeat.setItem(apkPath);
+			processed++;
+			if (!Files.exists(source)) {
+				writeLine(out, "[ApkSpy] Skipping unknown file " + apkPath + ": generated source missing");
+				skipped++;
+				continue;
+			}
+
+			Files.createDirectories(destination.getParent());
+			if (Files.exists(destination) && Files.mismatch(source, destination) == -1L) {
+				writeLine(out, "[ApkSpy] Skipping unknown file " + apkPath + ": destination already identical at "
+						+ destination.toAbsolutePath());
+				skipped++;
+				continue;
+			}
+
+			Files.copy(source, destination, StandardCopyOption.REPLACE_EXISTING);
+			writeLine(out, "[ApkSpy] Copied unknown file " + apkPath + " -> " + destination.toAbsolutePath());
+			copied++;
+			long now = System.nanoTime();
+			if (processed % FILE_PROGRESS_LOG_INTERVAL == 0
+					|| TimeUnit.NANOSECONDS.toMillis(now - lastProgressLogAt) >= FILE_PROGRESS_HEARTBEAT_MS) {
+				writeLine(out, "[ApkSpy] unknown files merge progress: processed=" + processed
+						+ ", copied=" + copied + ", skipped=" + skipped + ", current=" + apkPath);
+				lastProgressLogAt = now;
+			}
+		}
+
+		Set<String> preservedOriginalOnly = new LinkedHashSet<>(originalUnknown.getFilesByApkPath().keySet());
+		preservedOriginalOnly.removeAll(generatedUnknown.getFilesByApkPath().keySet());
+		if (!preservedOriginalOnly.isEmpty()) {
+			writeLine(out, "[ApkSpy] Preserving original-only unknown files: "
+					+ formatDiagnosticPaths(preservedOriginalOnly));
+		}
+
+		for (String generatedMappingPath : generatedUnknown.getApktoolMappings().keySet()) {
+			if (!generatedUnknown.getFilesByApkPath().containsKey(generatedMappingPath)
+					&& !originalUnknown.getFilesByApkPath().containsKey(generatedMappingPath)) {
+				writeLine(out, "[ApkSpy] Skipping unknownFiles mapping " + generatedMappingPath
+						+ ": no matching file in generated or original decode tree");
+				skipped++;
+			}
+		}
+
+		Path originalApktoolYml = originalRoot.resolve("apktool.yml");
+		if (Files.exists(originalApktoolYml)) {
+			String originalApktoolContent = Files.readString(originalApktoolYml, StandardCharsets.UTF_8);
+			String mergedApktoolContent = mergeUnknownFilesSection(originalApktoolContent,
+					generatedUnknown.getApktoolMappings());
+			if (!mergedApktoolContent.equals(originalApktoolContent)) {
+				Files.writeString(originalApktoolYml, mergedApktoolContent, StandardCharsets.UTF_8);
+				writeLine(out, "[ApkSpy] Updated original apktool.yml unknownFiles section");
+			} else {
+				writeLine(out, "[ApkSpy] apktool.yml unknownFiles section unchanged");
+			}
+		} else {
+			writeLine(out, "[ApkSpy] Skipping unknownFiles mapping merge: original apktool.yml missing");
+		}
+
+		writeLine(out, "[ApkSpy] unknown files merge summary: copied=" + copied + ", skipped=" + skipped);
+	}
+
+	static void mergeUnknownFiles(UnknownFilesSnapshot generatedUnknown, Path originalRoot,
+			UnknownFilesSnapshot originalUnknown, OutputStream out) throws IOException {
+		try (PostProcessHeartbeat heartbeat = PostProcessHeartbeat.start(out)) {
+			heartbeat.setStage("unknown files merge/copy");
+			heartbeat.setItem("(test/helper)");
+			mergeUnknownFiles(generatedUnknown, originalRoot, originalUnknown, out, heartbeat);
+		}
+	}
+
+	static Map<String, String> parseUnknownFilesSection(String apktoolYmlContent) {
+		Map<String, String> mappings = new LinkedHashMap<>();
+		String[] lines = apktoolYmlContent.split("\\r?\\n", -1);
+		boolean inSection = false;
+		int sectionIndent = -1;
+		for (String line : lines) {
+			String trimmed = line.trim();
+			if (!inSection) {
+				if ("unknownFiles:".equals(trimmed)) {
+					inSection = true;
+					sectionIndent = countLeadingWhitespace(line);
+				}
+				continue;
+			}
+
+			if (!trimmed.isEmpty() && countLeadingWhitespace(line) <= sectionIndent) {
+				break;
+			}
+			if (trimmed.isEmpty()) {
+				continue;
+			}
+
+			int colonIndex = trimmed.indexOf(':');
+			if (colonIndex <= 0) {
+				continue;
+			}
+			String key = trimmed.substring(0, colonIndex).trim();
+			String value = trimmed.substring(colonIndex + 1).trim();
+			if ((key.startsWith("'") && key.endsWith("'")) || (key.startsWith("\"") && key.endsWith("\""))) {
+				key = key.substring(1, key.length() - 1);
+			}
+			mappings.put(key, value);
+		}
+		return mappings;
+	}
+
+	static String mergeUnknownFilesSection(String originalApktoolContent, Map<String, String> generatedMappings) {
+		if (generatedMappings.isEmpty()) {
+			return originalApktoolContent;
+		}
+
+		Map<String, String> mergedMappings = new LinkedHashMap<>(parseUnknownFilesSection(originalApktoolContent));
+		mergedMappings.putAll(generatedMappings);
+
+		String lineSeparator = originalApktoolContent.contains("\r\n") ? "\r\n" : "\n";
+		List<String> originalLines = Arrays.asList(originalApktoolContent.split("\\r?\\n", -1));
+		int sectionStart = -1;
+		int sectionEnd = originalLines.size();
+		int sectionIndent = -1;
+
+		for (int i = 0; i < originalLines.size(); i++) {
+			String line = originalLines.get(i);
+			if (sectionStart < 0) {
+				if ("unknownFiles:".equals(line.trim())) {
+					sectionStart = i;
+					sectionIndent = countLeadingWhitespace(line);
+				}
+				continue;
+			}
+
+			String trimmed = line.trim();
+			if (!trimmed.isEmpty() && countLeadingWhitespace(line) <= sectionIndent) {
+				sectionEnd = i;
+				break;
+			}
+		}
+
+		List<String> mergedLines = new ArrayList<>();
+		if (sectionStart < 0) {
+			mergedLines.addAll(originalLines);
+			if (!mergedLines.isEmpty() && !mergedLines.get(mergedLines.size() - 1).isEmpty()) {
+				mergedLines.add("");
+			}
+			mergedLines.addAll(renderUnknownFilesSectionLines(mergedMappings));
+		} else {
+			mergedLines.addAll(originalLines.subList(0, sectionStart));
+			mergedLines.addAll(renderUnknownFilesSectionLines(mergedMappings));
+			mergedLines.addAll(originalLines.subList(sectionEnd, originalLines.size()));
+		}
+		return String.join(lineSeparator, mergedLines);
+	}
+
+	private static List<String> renderUnknownFilesSectionLines(Map<String, String> mappings) {
+		List<String> lines = new ArrayList<>();
+		lines.add("unknownFiles:");
+		for (Map.Entry<String, String> mapping : mappings.entrySet()) {
+			lines.add("  " + mapping.getKey() + ": " + mapping.getValue());
+		}
+		return lines;
+	}
+
+	private static int countLeadingWhitespace(String line) {
+		int index = 0;
+		while (index < line.length() && Character.isWhitespace(line.charAt(index))) {
+			index++;
+		}
+		return index;
+	}
+
+	private static String normalizeRelativePath(Path relativePath) {
+		return relativePath.toString().replace('\\', '/');
+	}
+
+	private static Path toCanonicalOrAbsolutePath(Path path) throws IOException {
+		try {
+			return path.toRealPath();
+		} catch (IOException ignored) {
+			return path.toAbsolutePath().normalize();
+		}
+	}
+
+	private static String formatDiagnosticPaths(Set<String> paths) {
+		if (paths.isEmpty()) {
+			return "(none)";
+		}
+		List<String> sample = paths.stream().limit(MAX_DIAGNOSTIC_PATHS).collect(Collectors.toList());
+		if (paths.size() > sample.size()) {
+			return String.join(", ", sample) + " ... (" + (paths.size() - sample.size()) + " more)";
+		}
+		return String.join(", ", sample);
 	}
 
 	private static Path findRoot(Path file, Set<Path> roots) {
@@ -327,12 +645,129 @@ public class ApkSpy {
 		return null;
 	}
 
+	static Path prepareMergeDestination(Path sourcePath, Map<Path, Path> generatedToOriginalRoots, OutputStream out)
+			throws IOException {
+		Path generatedRoot = findRoot(sourcePath, generatedToOriginalRoots.keySet());
+		if (generatedRoot == null) {
+			return null;
+		}
+		Path destinationRoot = generatedToOriginalRoots.get(generatedRoot);
+		if (destinationRoot == null) {
+			return null;
+		}
+		if (!Files.isDirectory(destinationRoot)) {
+			Files.createDirectories(destinationRoot);
+			writeLine(out, "[ApkSpy] created missing root for merge output: " + destinationRoot.toAbsolutePath());
+		}
+		Path destinationPath = destinationRoot.resolve(generatedRoot.relativize(sourcePath));
+		Files.createDirectories(destinationPath.getParent());
+		return destinationPath;
+	}
+
 	private static boolean isSyntheticNestedClass(String ownerClassName, String candidateClassName) {
 		if (!candidateClassName.startsWith(ownerClassName + "$")) {
 			return false;
 		}
 		String suffix = candidateClassName.substring(ownerClassName.length() + 1);
 		return !suffix.isEmpty() && (Character.isDigit(suffix.charAt(0)) || suffix.contains("$$"));
+	}
+
+	static final class UnknownFilesSnapshot {
+		private final Path decodeRoot;
+		private final Map<String, Path> filesByApkPath;
+		private final Map<String, String> apktoolMappings;
+
+		UnknownFilesSnapshot(Path decodeRoot, Map<String, Path> filesByApkPath, Map<String, String> apktoolMappings) {
+			this.decodeRoot = decodeRoot;
+			this.filesByApkPath = filesByApkPath;
+			this.apktoolMappings = apktoolMappings;
+		}
+
+		Path getDecodeRoot() {
+			return decodeRoot;
+		}
+
+		Map<String, Path> getFilesByApkPath() {
+			return filesByApkPath;
+		}
+
+		Map<String, String> getApktoolMappings() {
+			return apktoolMappings;
+		}
+	}
+
+	enum RebuildStrategy {
+		SMALI_ONLY_NO_RES("smali-only-no-res",
+				"Pipeline changes smali/classes/unknown files only, so preserve original resources and avoid OEM/private resource aapt2 relinking.") {
+			@Override
+			boolean decodeResources() {
+				return false;
+			}
+		};
+
+		private final String id;
+		private final String description;
+
+		RebuildStrategy(String id, String description) {
+			this.id = id;
+			this.description = description;
+		}
+
+		String getId() {
+			return id;
+		}
+
+		String getDescription() {
+			return description;
+		}
+
+		abstract boolean decodeResources();
+	}
+
+	static final class PostProcessHeartbeat implements AutoCloseable {
+		private final AtomicBoolean running = new AtomicBoolean(true);
+		private final AtomicReference<String> stage = new AtomicReference<>("starting");
+		private final AtomicReference<String> item = new AtomicReference<>("(none)");
+		private final Thread thread;
+
+		private PostProcessHeartbeat(OutputStream out) {
+			thread = new Thread(() -> {
+				while (running.get()) {
+					try {
+						Thread.sleep(POST_PROCESS_HEARTBEAT_MS);
+						if (running.get()) {
+							writeLine(out, "[ApkSpy] post-process heartbeat: stage=" + stage.get()
+									+ ", item=" + item.get());
+						}
+					} catch (InterruptedException ignore) {
+						Thread.currentThread().interrupt();
+						break;
+					} catch (IOException ioException) {
+						break;
+					}
+				}
+			}, "apkspy-post-process-heartbeat");
+			thread.setDaemon(true);
+			thread.start();
+		}
+
+		static PostProcessHeartbeat start(OutputStream out) {
+			return new PostProcessHeartbeat(out);
+		}
+
+		void setStage(String stage) {
+			this.stage.set(stage);
+		}
+
+		void setItem(String item) {
+			this.item.set(item);
+		}
+
+		@Override
+		public void close() {
+			running.set(false);
+			thread.interrupt();
+		}
 	}
 
 	public static boolean lint(String apk, String className, ClassBreakdown content, String sdkPath, String jdkLocation, OutputStream out)
@@ -425,117 +860,199 @@ public class ApkSpy {
 				Paths.get("generated.apk"), StandardCopyOption.REPLACE_EXISTING);
 		Util.attemptDelete(new File("project-tmp"));
 
+		RebuildStrategy rebuildStrategy = selectRebuildStrategy(classes);
+		logRebuildStrategy(rebuildStrategy, out);
+
 		ApktoolWrapper.decode(Paths.get("generated.apk"), apktoolLocation, jdkLocation, "generated", false, out);
+		writeLine(out, "[ApkSpy] after decode generated: smali/generated (resources intentionally skipped with -r)");
+		UnknownFilesSnapshot generatedUnknown = collectUnknownFiles(Paths.get("smali", "generated"));
+		logUnknownFiles("generated", generatedUnknown, out);
 		Files.delete(Paths.get("generated.apk"));
 
-		ApktoolWrapper.decode(modifyingApk.toPath(), apktoolLocation, jdkLocation, "original", true, out);
+		ApktoolWrapper.decode(modifyingApk.toPath(), apktoolLocation, jdkLocation, "original",
+				rebuildStrategy.decodeResources(), out);
+		writeLine(out, "[ApkSpy] after decode original: smali/original "
+				+ (rebuildStrategy.decodeResources()
+						? "(resources kept for rebuild)"
+						: "(resources intentionally skipped for smali-only rebuild)"));
+		UnknownFilesSnapshot originalUnknown = collectUnknownFiles(Paths.get("smali", "original"));
+		logUnknownFiles("original", originalUnknown, out);
 
-		List<Path> smaliFolders = Files.list(Paths.get("smali", "generated"))
-				.filter(path -> Files.isDirectory(path) && path.getFileName().toString().startsWith("smali"))
-				.collect(Collectors.toList());
-		List<Path> destinationFolders = smaliFolders.stream()
-				.map(path -> Paths.get(path.toString().replace("generated", "original"))).collect(Collectors.toList());
-		Map<Path, Path> generatedToOriginalRoots = mapGeneratedToOriginalRoots(smaliFolders);
-		Map<String, Path> generatedIndex = indexSmaliFiles(smaliFolders);
-		Map<String, Path> originalIndex = indexSmaliFiles(destinationFolders);
+		try (PostProcessHeartbeat heartbeat = PostProcessHeartbeat.start(out)) {
+			try {
+				heartbeat.setStage("collect generated smali roots");
+				heartbeat.setItem(Paths.get("smali", "generated").toAbsolutePath().toString());
+				writeLine(out, "[ApkSpy] collecting generated smali roots");
+				List<Path> smaliFolders;
+				try (var generatedRoots = Files.list(Paths.get("smali", "generated"))) {
+					smaliFolders = generatedRoots
+							.filter(path -> Files.isDirectory(path) && path.getFileName().toString().startsWith("smali"))
+							.collect(Collectors.toList());
+				}
+				writeLine(out, "[ApkSpy] collected generated smali roots: " + smaliFolders.size() + " -> "
+						+ smaliFolders.stream().map(path -> path.getFileName().toString()).collect(Collectors.joining(", ")));
 
-		for (Map.Entry<String, ClassBreakdown> classEntry : classes.entrySet()) {
-			String className = classEntry.getKey();
-			ClassBreakdown breakdown = classEntry.getValue();
-			Path generatedClassPath = generatedIndex.get(className);
+				heartbeat.setStage("map original smali roots");
+				List<Path> destinationFolders = smaliFolders.stream()
+						.map(path -> Paths.get(path.toString().replace("generated", "original"))).collect(Collectors.toList());
+				Map<Path, Path> generatedToOriginalRoots = mapGeneratedToOriginalRoots(smaliFolders, out);
+				List<Path> existingOriginalRoots = collectExistingRoots(generatedToOriginalRoots);
+				writeLine(out, "[ApkSpy] mapped original smali roots: " + destinationFolders.size() + " -> "
+						+ destinationFolders.stream().map(path -> path.getFileName().toString())
+								.collect(Collectors.joining(", ")));
+				writeLine(out, "[ApkSpy] existing original smali roots for indexing: " + existingOriginalRoots.size()
+						+ " -> " + existingOriginalRoots.stream().map(path -> path.getFileName().toString())
+								.collect(Collectors.joining(", ")));
 
-			if (generatedClassPath == null) {
-				writeLine(out, "[ApkSpy] Could not locate generated smali for " + className);
-				continue;
-			}
+				Map<String, Path> generatedIndex = indexSmaliFiles(smaliFolders, "generated", out, heartbeat);
+				Map<String, Path> originalIndex = indexSmaliFiles(existingOriginalRoots, "original", out, heartbeat);
+				writeLine(out, "[ApkSpy] before smali merge: generatedSmaliDirs=" + smaliFolders.size()
+						+ ", originalSmaliDirs=" + existingOriginalRoots.size()
+						+ ", generatedClasses=" + generatedIndex.size()
+						+ ", originalClasses=" + originalIndex.size());
 
-			Path originalClassPath = originalIndex.get(className);
-			if (originalClassPath != null) {
-				LOG.info("Merging smali for class: {}", className);
+				heartbeat.setStage("smali merge");
+				int mergedClasses = 0;
+				int copiedClasses = 0;
+				int skippedClasses = 0;
+				int classProgress = 0;
+				for (Map.Entry<String, ClassBreakdown> classEntry : classes.entrySet()) {
+					String className = classEntry.getKey();
+					ClassBreakdown breakdown = classEntry.getValue();
+					heartbeat.setItem(className);
+					classProgress++;
+					writeLine(out, "[ApkSpy] smali merge progress " + classProgress + "/" + classes.size()
+							+ ": " + className);
+					Path generatedClassPath = generatedIndex.get(className);
 
-				String modifiedContent = Files.readString(generatedClassPath, StandardCharsets.UTF_8);
-				String originalContent = Files.readString(originalClassPath, StandardCharsets.UTF_8);
-				SmaliBreakdown modifiedSmali = SmaliBreakdown.breakdown(modifiedContent);
-				List<SmaliMethod> methods = modifiedSmali.getChangedMethods(breakdown);
-
-				writeLine(out, "[ApkSpy] Merging " + methods.size() + " method(s) for " + className);
-				StringBuilder builder = new StringBuilder(originalContent);
-				for (SmaliMethod method : methods) {
-					SmaliBreakdown originalSmali = SmaliBreakdown.breakdown(builder.toString());
-					SmaliMethod equivalentMethod = originalSmali.getEquivalentMethod(method);
-					if (equivalentMethod == null) {
-						writeLine(out, "[ApkSpy] Could not find matching original method for " + className + ": "
-								+ method.getContent().split("\n")[0]);
+					if (generatedClassPath == null) {
+						writeLine(out, "[ApkSpy] Could not locate generated smali for " + className);
+						skippedClasses++;
 						continue;
 					}
 
-					builder.delete(equivalentMethod.getStart(), equivalentMethod.getEnd());
-					builder.insert(equivalentMethod.getStart(), method.getContent());
-				}
+					Path originalClassPath = originalIndex.get(className);
+					if (originalClassPath != null) {
+						LOG.info("Merging smali for class: {}", className);
+						writeLine(out, "[ApkSpy] merging class family for " + className
+								+ " using generated " + generatedClassPath.toAbsolutePath()
+								+ " and original " + originalClassPath.toAbsolutePath());
 
-				Files.writeString(originalClassPath, builder.toString(), StandardOpenOption.TRUNCATE_EXISTING,
-						StandardOpenOption.WRITE);
+						String modifiedContent = Files.readString(generatedClassPath, StandardCharsets.UTF_8);
+						String originalContent = Files.readString(originalClassPath, StandardCharsets.UTF_8);
+						SmaliBreakdown modifiedSmali = SmaliBreakdown.breakdown(modifiedContent);
+						List<SmaliMethod> methods = modifiedSmali.getChangedMethods(breakdown);
 
-				for (Map.Entry<String, Path> generatedClassEntry : generatedIndex.entrySet()) {
-					String generatedClassName = generatedClassEntry.getKey();
-					if (!isSyntheticNestedClass(className, generatedClassName)) {
+						writeLine(out, "[ApkSpy] Merging " + methods.size() + " method(s) for " + className);
+						StringBuilder builder = new StringBuilder(originalContent);
+						for (SmaliMethod method : methods) {
+							heartbeat.setItem(className + " :: " + method.getContent().split("\n")[0]);
+							SmaliBreakdown originalSmali = SmaliBreakdown.breakdown(builder.toString());
+							SmaliMethod equivalentMethod = originalSmali.getEquivalentMethod(method);
+							if (equivalentMethod == null) {
+								writeLine(out, "[ApkSpy] Could not find matching original method for " + className + ": "
+										+ method.getContent().split("\n")[0]);
+								continue;
+							}
+
+							builder.delete(equivalentMethod.getStart(), equivalentMethod.getEnd());
+							builder.insert(equivalentMethod.getStart(), method.getContent());
+						}
+
+						Files.writeString(originalClassPath, builder.toString(), StandardOpenOption.TRUNCATE_EXISTING,
+								StandardOpenOption.WRITE);
+						mergedClasses++;
+
+						for (Map.Entry<String, Path> generatedClassEntry : generatedIndex.entrySet()) {
+							String generatedClassName = generatedClassEntry.getKey();
+							if (!isSyntheticNestedClass(className, generatedClassName)) {
+								continue;
+							}
+
+							Path sourcePath = generatedClassEntry.getValue();
+							Path destinationPath = prepareMergeDestination(sourcePath, generatedToOriginalRoots, out);
+							if (destinationPath == null) {
+								writeLine(out, "[ApkSpy] Skipping nested class " + generatedClassName
+										+ ": no generated root found");
+								continue;
+							}
+							if (originalIndex.containsKey(generatedClassName)) {
+								writeLine(out, "[ApkSpy] Skipping nested class overwrite due to name collision: "
+										+ generatedClassName);
+								continue;
+							}
+							Files.copy(sourcePath, destinationPath, StandardCopyOption.REPLACE_EXISTING);
+							writeLine(out, "[ApkSpy] Copied nested class " + generatedClassName + " -> "
+									+ destinationPath.toAbsolutePath());
+							originalIndex.put(generatedClassName, destinationPath);
+						}
 						continue;
 					}
 
-					Path sourcePath = generatedClassEntry.getValue();
-					Path generatedRoot = findRoot(sourcePath, generatedToOriginalRoots.keySet());
-					if (generatedRoot == null) {
-						continue;
+					writeLine(out, "[ApkSpy] Copying added class family: " + className);
+					for (Map.Entry<String, Path> generatedClassEntry : generatedIndex.entrySet()) {
+						String generatedClassName = generatedClassEntry.getKey();
+						if (!generatedClassName.equals(className) && !generatedClassName.startsWith(className + "$")) {
+							continue;
+						}
+
+						Path sourcePath = generatedClassEntry.getValue();
+						Path destinationPath = prepareMergeDestination(sourcePath, generatedToOriginalRoots, out);
+						if (destinationPath == null) {
+							writeLine(out, "[ApkSpy] Skipping added class copy for " + generatedClassName
+									+ ": no generated root found");
+							continue;
+						}
+						Files.copy(sourcePath, destinationPath, StandardCopyOption.REPLACE_EXISTING);
+						writeLine(out, "[ApkSpy] Copied added class " + generatedClassName + " -> "
+								+ destinationPath.toAbsolutePath());
+						originalIndex.put(generatedClassName, destinationPath);
+						copiedClasses++;
 					}
+				}
+				writeLine(out, "[ApkSpy] after smali merge: mergedClasses=" + mergedClasses
+						+ ", copiedClasses=" + copiedClasses + ", skippedClasses=" + skippedClasses);
 
-					Path destinationRoot = generatedToOriginalRoots.get(generatedRoot);
-					Path destinationPath = destinationRoot.resolve(generatedRoot.relativize(sourcePath));
-					if (originalIndex.containsKey(generatedClassName)) {
-						writeLine(out, "[ApkSpy] Skipping nested class overwrite due to name collision: "
-								+ generatedClassName);
-						continue;
+				mergeUnknownFiles(generatedUnknown, Paths.get("smali", "original"), originalUnknown, out, heartbeat);
+				writeLine(out, "[ApkSpy] after unknown files merge/copy");
+
+				Set<String> deletions = ChangeCache.getInstance().getClassDeletions();
+				heartbeat.setStage("apply deletions");
+				heartbeat.setItem("(class deletions)");
+				writeLine(out, "[ApkSpy] applying class deletions: count=" + deletions.size());
+				for (String deletion : deletions) {
+					heartbeat.setItem(deletion);
+					boolean deleted = false;
+					for (Path path : destinationFolders) {
+						Path candidate = Paths.get(path.toAbsolutePath().toString(), deletion);
+						if (Files.deleteIfExists(candidate)) {
+							writeLine(out, "[ApkSpy] Deleted class file " + candidate.toAbsolutePath());
+							deleted = true;
+							break;
+						}
 					}
-					Files.createDirectories(destinationPath.getParent());
-					Files.copy(sourcePath, destinationPath, StandardCopyOption.REPLACE_EXISTING);
-					originalIndex.put(generatedClassName, destinationPath);
+					if (!deleted) {
+						writeLine(out, "[ApkSpy] Deletion target not found: " + deletion);
+					}
 				}
-				continue;
-			}
-
-			writeLine(out, "[ApkSpy] Copying added class: " + className);
-			for (Map.Entry<String, Path> generatedClassEntry : generatedIndex.entrySet()) {
-				String generatedClassName = generatedClassEntry.getKey();
-				if (!generatedClassName.equals(className) && !generatedClassName.startsWith(className + "$")) {
-					continue;
+			} catch (IOException throwable) {
+				try {
+					writeException(out, "post-process pipeline", throwable);
+				} catch (IOException logFailure) {
+					throwable.addSuppressed(logFailure);
 				}
-
-				Path sourcePath = generatedClassEntry.getValue();
-				Path generatedRoot = findRoot(sourcePath, generatedToOriginalRoots.keySet());
-				if (generatedRoot == null) {
-					continue;
+				throw throwable;
+			} catch (RuntimeException | Error throwable) {
+				try {
+					writeException(out, "post-process pipeline", throwable);
+				} catch (IOException logFailure) {
+					throwable.addSuppressed(logFailure);
 				}
-
-				Path destinationRoot = generatedToOriginalRoots.get(generatedRoot);
-				Path destinationPath = destinationRoot.resolve(generatedRoot.relativize(sourcePath));
-				Files.createDirectories(destinationPath.getParent());
-				Files.copy(sourcePath, destinationPath, StandardCopyOption.REPLACE_EXISTING);
-				originalIndex.put(generatedClassName, destinationPath);
+				throw throwable;
 			}
 		}
 
-		Set<String> deletions = ChangeCache.getInstance().getClassDeletions();
-		for (String deletion : deletions) {
-			// file might not exist, as we could delete temporary classes that we made in
-			// between compilations in the editor
-
-			for (Path path : destinationFolders) {
-				if (Files.deleteIfExists(Paths.get(path.toAbsolutePath().toString(),
-						deletion))) {
-					break;
-				}
-			}
-		}
-
+		writeLine(out, "[ApkSpy] before rebuild: smali/original using strategy " + rebuildStrategy.getId());
 		ApktoolWrapper.build(Paths.get("smali", "original"), apktoolLocation, jdkLocation, outputLocation, out);
 		Util.attemptDelete(new File("smali"));
 
