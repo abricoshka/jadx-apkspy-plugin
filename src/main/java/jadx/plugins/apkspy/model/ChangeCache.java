@@ -17,6 +17,7 @@ public class ChangeCache {
 	private static ChangeCache instance = null;
 	private final Map<String, ClassBreakdown> CHANGES = new HashMap<>();
 	private final Set<String> CLASS_DELETIONS = new HashSet<>();
+	private final CompileRenameRegistry RENAME_REGISTRY = new CompileRenameRegistry();
 
 	public static ChangeCache getInstance() {
 		if (instance == null) {
@@ -44,6 +45,14 @@ public class ChangeCache {
 
 	public Set<String> getClassDeletions() {
 		return CLASS_DELETIONS;
+	}
+
+	public CompileRenameRegistry getRenameRegistry() {
+		return RENAME_REGISTRY;
+	}
+
+	public void mergeRenameRegistry(CompileRenameRegistry registry) {
+		RENAME_REGISTRY.merge(registry);
 	}
 
 	public boolean hasChanges() {

@@ -12,6 +12,7 @@ import jadx.gui.ui.MainWindow;
 import jadx.gui.ui.codearea.AbstractCodeArea;
 import jadx.gui.ui.codearea.AbstractCodeContentPanel;
 import jadx.gui.ui.panel.ContentPanel;
+import jadx.plugins.apkspy.JadxRenameCollector;
 import jadx.plugins.apkspy.ApkSpyOptions;
 import jadx.plugins.apkspy.model.ChangeCache;
 import jadx.plugins.apkspy.model.ClassBreakdown;
@@ -30,7 +31,7 @@ public class EditMethodDialog extends ApkSpyDialog {
 	}
 
 	private ClassBreakdown merge(final ClassBreakdown changed, final ClassBreakdown original) {
-		return changed.mergeMemberVariables(original.getMemberVariables())
+		return changed.mergeFieldStubs(original.getMemberVariables())
 				.mergeMethodStubs(original.getMethods()).mergeInnerClassStubs(original);
 	}
 
@@ -45,6 +46,7 @@ public class EditMethodDialog extends ApkSpyDialog {
 		final ClassBreakdown completed = original.mergeImports(changed.getImports())
 				.mergeMethods(changed.getChangedMethods());
 
+		ChangeCache.getInstance().mergeRenameRegistry(JadxRenameCollector.collect(decompiler, clsNode));
 		ChangeCache.getInstance().putChange(clsNode.getFullName(), this.merge(changed, original), changed.getMethods().get(0));
 
 		decompiler.getRoot().getCodeCache().add(clsNode.getFullName(),
@@ -68,6 +70,7 @@ public class EditMethodDialog extends ApkSpyDialog {
 		final ClassBreakdown original = ClassBreakdown.breakdown(clsNode.getFullName(), clsNode.getName(), originalCode);
 		final ClassBreakdown changed = ClassBreakdown.breakdown(clsNode.getFullName(), clsNode.getName(),
 				Util.formatSources(codeArea.getText()));
+		ChangeCache.getInstance().mergeRenameRegistry(JadxRenameCollector.collect(decompiler, clsNode));
 		return this.merge(changed, original);
 	}
 }

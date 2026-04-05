@@ -148,4 +148,61 @@ public class ClassBreakdownTest {
 		Assertions.assertEquals(1, original.getMethods().size());
 		Assertions.assertEquals("@Override // java.lang.Object\npublic String toString() {", original.getMethods().get(0).getHeader());
 	}
+
+	@Test
+	void testMergeMethodStubsMatchesBySignature() {
+		final String originalCode = "package jadx.plugin.apkspy.test;\n" +
+				"\n" +
+				"public class TestClass {\n" +
+				"    @Override\n" +
+				"    public String toString() {\n" +
+				"        return \"original\";\n" +
+				"    }\n" +
+				"}";
+		final String modifiedCode = "package jadx.plugin.apkspy.test;\n" +
+				"\n" +
+				"public class TestClass {\n" +
+				"    public String toString() {\n" +
+				"        return \"modified\";\n" +
+				"    }\n" +
+				"}";
+		final String fullName = "jadx.plugin.apkspy.test.TestClass";
+		final String name = "TestClass";
+		final ClassBreakdown original = ClassBreakdown.breakdown(fullName, name, originalCode);
+		final ClassBreakdown changed = ClassBreakdown.breakdown(fullName, name, modifiedCode);
+
+		final ClassBreakdown compileShell = changed.mergeFieldStubs(original.getMemberVariables())
+				.mergeMethodStubs(original.getMethods());
+
+		Assertions.assertEquals(1, compileShell.getMethods().size());
+	}
+
+	@Test
+	void testStubSanitizesFieldInitializers() {
+		final String originalCode = "package jadx.plugin.apkspy.test;\n" +
+				"\n" +
+				"public class TestClass {\n" +
+				"    private final Runnable callback = new Runnable() {\n" +
+				"        @Override\n" +
+				"        public void run() {\n" +
+				"        }\n" +
+				"    };\n" +
+				"    private static final int MAGIC = 42;\n" +
+				"    private final String value = getValue();\n" +
+				"\n" +
+				"    public String getValue() {\n" +
+				"        return \"value\";\n" +
+				"    }\n" +
+				"}";
+		final String fullName = "jadx.plugin.apkspy.test.TestClass";
+		final String name = "TestClass";
+		final ClassBreakdown original = ClassBreakdown.breakdown(fullName, name, originalCode);
+		final ClassBreakdown stubbed = original.asStub();
+
+		Assertions.assertTrue(stubbed.getMemberVariables().contains("private Runnable callback;"));
+		Assertions.assertTrue(stubbed.getMemberVariables().contains("private static final int MAGIC = 42;"));
+		Assertions.assertTrue(stubbed.getMemberVariables().contains("private String value;"));
+		Assertions.assertFalse(stubbed.getMemberVariables().contains("new Runnable()"));
+		Assertions.assertFalse(stubbed.getMemberVariables().contains("getValue()"));
+	}
 }

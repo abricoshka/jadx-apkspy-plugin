@@ -21,6 +21,7 @@ build/
 classes/
 idea/
 .gradle/
+.gradle-project-cache/
 
 *-tmp/
 **/tmp/

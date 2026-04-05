@@ -10,12 +10,18 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -32,6 +38,7 @@ import jadx.plugins.apkspy.utils.Util;
 public class ApkSpy {
 
 	private static final Logger LOG = LoggerFactory.getLogger(ApkSpy.class);
+	private static final String STUB_CACHE_VERSION = "apkspy-stub-v5";
 
 	private static String getClasspath(String... libs) {
 	    return Arrays.stream(libs)
@@ -78,6 +85,256 @@ public class ApkSpy {
 		return null;
 	}
 
+	private static void writeLine(OutputStream out, String message) throws IOException {
+		out.write(message.getBytes(StandardCharsets.UTF_8));
+		out.write('\n');
+	}
+
+	private static Set<String> toJarEntries(Set<String> classNames) {
+		return classNames.stream()
+				.map(className -> className.replace('.', '/') + ".class")
+				.collect(Collectors.toCollection(HashSet::new));
+	}
+
+	private static String buildStubSuffix(Map<String, ClassBreakdown> classes) {
+		List<String> sortedNames = new ArrayList<>(classes.keySet());
+		Collections.sort(sortedNames);
+
+		StringBuilder fingerprint = new StringBuilder(STUB_CACHE_VERSION).append('\n');
+		for (String className : sortedNames) {
+			fingerprint.append(className)
+					.append("::")
+					.append(classes.get(className).toString().hashCode())
+					.append('\n');
+		}
+		return Integer.toHexString(fingerprint.toString().hashCode());
+	}
+
+	private static Path getStubJarPath(File apk, Map<String, ClassBreakdown> classes) {
+		return Paths.get(System.getProperty("java.io.tmpdir"), "apkSpy",
+				apk.getName().replace('.', '_') + "_" + buildStubSuffix(classes) + "_stub.jar");
+	}
+
+	private static boolean isExcludedClassEntry(String entryName, Set<String> classNames) {
+		if (!entryName.endsWith(".class")) {
+			return false;
+		}
+		String classEntry = entryName.substring(0, entryName.length() - ".class".length()).replace('\\', '/');
+		for (String className : classNames) {
+			String internalName = className.replace('.', '/');
+			if (classEntry.equals(internalName) || classEntry.startsWith(internalName + "$")) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static boolean shouldRegenerateStubJar(Path stubPath, Set<String> classNames, OutputStream out)
+			throws IOException {
+		int backslashEntries = 0;
+		List<String> excludedEntries = new ArrayList<>();
+
+		try (JarFile jarFile = new JarFile(stubPath.toFile())) {
+			Enumeration<JarEntry> entries = jarFile.entries();
+			while (entries.hasMoreElements()) {
+				JarEntry entry = entries.nextElement();
+				if (entry.getName().indexOf('\\') >= 0) {
+					backslashEntries++;
+				}
+				if (isExcludedClassEntry(entry.getName(), classNames)) {
+					excludedEntries.add(entry.getName().replace('\\', '/'));
+				}
+			}
+		} catch (IOException e) {
+			writeLine(out, "[ApkSpy] Regenerating stub.jar because it could not be read: " + e.getMessage());
+			return true;
+		}
+
+		if (backslashEntries > 0) {
+			writeLine(out, "[ApkSpy] Regenerating stub.jar because it contains " + backslashEntries
+					+ " non-portable jar entries with '\\'.");
+			return true;
+		}
+		if (!excludedEntries.isEmpty()) {
+			writeLine(out, "[ApkSpy] Regenerating stub.jar because compile targets are still bundled: "
+					+ String.join(", ", excludedEntries));
+			return true;
+		}
+		return false;
+	}
+
+	private static void ensureStubJar(File apk, Path stubPath, OutputStream out, Map<String, ClassBreakdown> classes)
+			throws IOException, InterruptedException {
+		Files.createDirectories(stubPath.getParent());
+		if (!Files.exists(stubPath) || shouldRegenerateStubJar(stubPath, classes.keySet(), out)) {
+			JarGenerator.generateStubJar(apk, stubPath.toFile(), out, classes);
+		}
+	}
+
+	private static void logStubJarDiagnostics(Path stubPath, Set<String> classNames, OutputStream out) throws IOException {
+		Set<String> excludedEntries = toJarEntries(classNames);
+		List<String> bundledExcludedEntries = new ArrayList<>();
+		List<String> sampleEntries = new ArrayList<>();
+		int classEntries = 0;
+		int backslashEntries = 0;
+
+		try (JarFile jarFile = new JarFile(stubPath.toFile())) {
+			Enumeration<JarEntry> entries = jarFile.entries();
+			while (entries.hasMoreElements()) {
+				JarEntry entry = entries.nextElement();
+				String normalizedEntry = entry.getName().replace('\\', '/');
+				if (entry.getName().indexOf('\\') >= 0) {
+					backslashEntries++;
+				}
+				if (normalizedEntry.endsWith(".class")) {
+					classEntries++;
+					if (sampleEntries.size() < 15) {
+						sampleEntries.add(normalizedEntry);
+					}
+				}
+				if (excludedEntries.contains(normalizedEntry) || isExcludedClassEntry(normalizedEntry, classNames)) {
+					bundledExcludedEntries.add(normalizedEntry);
+				}
+			}
+		}
+
+		writeLine(out, "[ApkSpy] stub.jar path: " + stubPath.toAbsolutePath());
+		writeLine(out, "[ApkSpy] stub.jar size: " + Files.size(stubPath) + " bytes");
+		writeLine(out, "[ApkSpy] stub.jar class entries: " + classEntries);
+		writeLine(out, "[ApkSpy] stub.jar entries using '\\': " + backslashEntries);
+		if (bundledExcludedEntries.isEmpty()) {
+			writeLine(out, "[ApkSpy] stub.jar excludes compile targets as expected.");
+		} else {
+			writeLine(out, "[ApkSpy] stub.jar still contains compile targets: "
+					+ String.join(", ", bundledExcludedEntries));
+		}
+		if (!sampleEntries.isEmpty()) {
+			writeLine(out, "[ApkSpy] stub.jar sample entries: " + String.join(", ", sampleEntries));
+		}
+	}
+
+	private static void mergeResourceReferences(Map<String, Set<String>> mergedReferences,
+			Map<String, Set<String>> additionalReferences) {
+		for (Map.Entry<String, Set<String>> referenceEntry : additionalReferences.entrySet()) {
+			mergedReferences.computeIfAbsent(referenceEntry.getKey(), key -> new HashSet<>())
+					.addAll(referenceEntry.getValue());
+		}
+	}
+
+	private static String getPackageName(String className) {
+		return className.contains(".") ? className.substring(0, className.lastIndexOf('.')) : "";
+	}
+
+	private static void configureBuildGradle(Path gradleBuildPath, String applicationId,
+			Map<String, ClassBreakdown> classes, OutputStream out) throws IOException {
+		String buildGradle = Files.readString(gradleBuildPath, StandardCharsets.UTF_8);
+		CompileDependencyResolver.DependencySelection dependencySelection = CompileDependencyResolver.resolve(classes);
+		buildGradle = buildGradle.replace("$APPLICATION_ID", applicationId)
+				.replace("$APKSPY_DEPENDENCIES", dependencySelection.getRenderedDependencies());
+		Files.writeString(gradleBuildPath, buildGradle, StandardCharsets.UTF_8);
+
+		writeLine(out, "[ApkSpy] dependency profile: " + dependencySelection.getProfileSummary());
+		if (dependencySelection.usesAndroidX() && dependencySelection.usesSupport()) {
+			writeLine(out, "[ApkSpy] dependency profile uses mixed AndroidX/support compileOnly fallbacks only.");
+		}
+	}
+
+	private static void writeSources(Path sourceRoot, Map<String, ClassBreakdown> classes, OutputStream out) throws IOException {
+		Map<String, Map<String, Set<String>>> packageResourceReferences = new HashMap<>();
+		Set<String> packagesWithRealR = classes.entrySet().stream()
+				.filter(entry -> "R".equals(entry.getValue().getSimpleName())
+						|| entry.getKey().endsWith(".R")
+						|| "R".equals(entry.getKey()))
+				.map(entry -> getPackageName(entry.getKey()))
+				.collect(Collectors.toSet());
+
+		for (Map.Entry<String, ClassBreakdown> entry : classes.entrySet()) {
+			String className = entry.getKey();
+			ClassBreakdown content = entry.getValue();
+			String packageName = getPackageName(className);
+			String simpleName = content.getSimpleName() != null ? content.getSimpleName()
+					: className.substring(className.lastIndexOf('.') + 1);
+
+			Path folder = packageName.isEmpty()
+					? sourceRoot
+					: sourceRoot.resolve(packageName.replace('.', File.separatorChar));
+			Files.createDirectories(folder);
+
+			CompileSourceNormalizer.NormalizedSource normalizedSource = CompileSourceNormalizer.normalize(className,
+					content.toString());
+			for (String diagnostic : normalizedSource.getDiagnostics()) {
+				writeLine(out, "[ApkSpy] " + className + ": " + diagnostic);
+			}
+			if (!"R".equals(simpleName) && !packagesWithRealR.contains(packageName)
+					&& !normalizedSource.getRReferences().isEmpty()) {
+				mergeResourceReferences(
+						packageResourceReferences.computeIfAbsent(packageName, key -> new HashMap<>()),
+						normalizedSource.getRReferences());
+			}
+
+			Path file = folder.resolve(simpleName + ".java");
+			Files.writeString(file, normalizedSource.getSource(), StandardCharsets.UTF_8);
+			writeLine(out, "[ApkSpy] source: " + file.toAbsolutePath());
+		}
+
+		for (Map.Entry<String, Map<String, Set<String>>> packageEntry : packageResourceReferences.entrySet()) {
+			String packageName = packageEntry.getKey();
+			Path folder = packageName.isEmpty()
+					? sourceRoot
+					: sourceRoot.resolve(packageName.replace('.', File.separatorChar));
+			Files.createDirectories(folder);
+
+			Path rFile = folder.resolve("R.java");
+			Files.writeString(rFile, CompileSourceNormalizer.renderRSource(packageName, packageEntry.getValue()),
+					StandardCharsets.UTF_8);
+			writeLine(out, "[ApkSpy] compile-time R stub: " + rFile.toAbsolutePath());
+		}
+	}
+
+	private static Map<String, Path> indexSmaliFiles(List<Path> roots) throws IOException {
+		Map<String, Path> index = new HashMap<>();
+		for (Path root : roots) {
+			try (var paths = Files.walk(root)) {
+				List<Path> smaliFiles = paths
+						.filter(path -> Files.isRegularFile(path) && path.getFileName().toString().endsWith(".smali"))
+						.collect(Collectors.toList());
+				for (Path smaliFile : smaliFiles) {
+					String content = Files.readString(smaliFile, StandardCharsets.UTF_8);
+					String className = SmaliBreakdown.breakdown(content).getClassName();
+					if (!className.isEmpty()) {
+						index.putIfAbsent(className, smaliFile);
+					}
+				}
+			}
+		}
+		return index;
+	}
+
+	private static Map<Path, Path> mapGeneratedToOriginalRoots(List<Path> generatedRoots) {
+		Map<Path, Path> rootMap = new HashMap<>();
+		for (Path generatedRoot : generatedRoots) {
+			rootMap.put(generatedRoot, Paths.get(generatedRoot.toString().replace("generated", "original")));
+		}
+		return rootMap;
+	}
+
+	private static Path findRoot(Path file, Set<Path> roots) {
+		for (Path root : roots) {
+			if (file.startsWith(root)) {
+				return root;
+			}
+		}
+		return null;
+	}
+
+	private static boolean isSyntheticNestedClass(String ownerClassName, String candidateClassName) {
+		if (!candidateClassName.startsWith(ownerClassName + "$")) {
+			return false;
+		}
+		String suffix = candidateClassName.substring(ownerClassName.length() + 1);
+		return !suffix.isEmpty() && (Character.isDigit(suffix.charAt(0)) || suffix.contains("$$"));
+	}
+
 	public static boolean lint(String apk, String className, ClassBreakdown content, String sdkPath, String jdkLocation, OutputStream out)
 			throws IOException, InterruptedException {
 		LOG.info("Linting: {}", apk);
@@ -86,52 +343,34 @@ public class ApkSpy {
 		Map<String, ClassBreakdown> classes = Collections.singletonMap(className, content);
 
 		Util.attemptDelete(root.toFile());
+		copyProjectTemplate(root.toFile());
 
-		String source = content.toString();
-		String pkg = className.substring(0, className.lastIndexOf('.'));
-		String declaredType = findDeclaredTypeName(source);
-		
-		Path folder = root.resolve(Paths.get("src", pkg.replace('.', File.separatorChar)));
-		Files.createDirectories(folder);
-		
-		Path file = folder.resolve(declaredType + ".java");
-		Files.writeString(file, source, StandardCharsets.UTF_8);
+		sdkPath = sdkPath.replace("\\", "\\\\");
+		Files.write(root.resolve("local.properties"),
+				("sdk.dir=" + sdkPath).getBytes(StandardCharsets.UTF_8));
 
-		Path stubPath = Paths.get(System.getProperty("java.io.tmpdir"), "apkSpy",
-				modifyingApk.getName().replace('.', '_') + "stub.jar");
-		if (!Files.exists(stubPath)) {
-			JarGenerator.generateStubJar(modifyingApk, stubPath.toFile(), out, classes);
-		}
-		Files.createDirectories(root.resolve("libs"));
-		Files.copy(stubPath, Paths.get("project-tmp", "libs", "stub.jar"));
+		Path gradleBuildPath = root.resolve(Paths.get("app", "build.gradle"));
+		configureBuildGradle(gradleBuildPath, "lint", classes, out);
 
-		Files.createDirectories(root.resolve("bin"));
+		writeSources(root.resolve(Paths.get("app", "src", "main", "java")), classes, out);
 
-		Path javac = null;
-		if (jdkLocation != null && !jdkLocation.isEmpty()) {
-			javac = Paths.get(jdkLocation, "bin", "javac");
-			// if (System.getenv("JAVA_HOME") != null) {
-			// javac = Paths.get(System.getenv("JAVA_HOME"), "bin", "javac");
-			if (!Files.isExecutable(javac)) {
-				javac = javac.getParent().resolve("javac.exe");
-				if (!Files.isExecutable(javac)) {
-					javac = null;
-				}
-			}
+		Path stubPath = getStubJarPath(modifyingApk, classes);
+		ensureStubJar(modifyingApk, stubPath, out, classes);
+
+		Path libsDir = root.resolve(Paths.get("app", "libs"));
+		Files.createDirectories(libsDir);
+		Path projectStubPath = libsDir.resolve("stub.jar");
+		Files.copy(stubPath, projectStubPath, StandardCopyOption.REPLACE_EXISTING);
+		logStubJarDiagnostics(projectStubPath, classes.keySet(), out);
+
+		if (!Util.isWindows()) {
+			Runtime.getRuntime().exec("chmod +x project-tmp/gradlew").waitFor();
 		}
 
 		out.write("Started compile...\n".getBytes(StandardCharsets.UTF_8));
-		String targetVersionDir = findLatestAndroidJars(sdkPath);
-		int code = Util.system(root.resolve("src").toFile(), jdkLocation, new OutputStream() {
-			@Override
-			public void write(int b) throws IOException {
-				out.write(b);
-			}
-		}, javac == null ? "javac" : javac.toAbsolutePath().toString(), "-cp",
-				getClasspath(targetVersionDir + File.separator + "android.jar", "stub.jar",
-						targetVersionDir + File.separator + "optional" + File.separator + "org.apache.http.legacy.jar"),
-				"-d",
-				".." + File.separator + "bin", pkg.replace('.', File.separatorChar) + File.separator + declaredType + ".java");
+		int code = Util.system(root.toFile(), jdkLocation, out,
+				new File("project-tmp").getAbsolutePath() + File.separator + (Util.isWindows() ? "gradlew.bat" : "gradlew"),
+				":app:compileDebugJavaWithJavac");
 
 		Util.attemptDelete(root.toFile());
 
@@ -155,39 +394,14 @@ public class ApkSpy {
 		Files.write(Paths.get("project-tmp", "local.properties"),
 				("sdk.dir=" + sdkPath).getBytes(StandardCharsets.UTF_8));
 
-		Path gradleBuildPath = Paths.get("project-tmp", "app", "build.gradle");
-		String buildGradle = new String(Files.readAllBytes(gradleBuildPath), StandardCharsets.UTF_8);
-		buildGradle = buildGradle.replace("$APPLICATION_ID", applicationId);
-
-		Files.write(gradleBuildPath, buildGradle.getBytes(StandardCharsets.UTF_8));
-
 		Map<String, ClassBreakdown> classes = ChangeCache.getInstance().getChanges();
-		for (Map.Entry<String, ClassBreakdown> entry : classes.entrySet()) {
-			String className = entry.getKey();
-			ClassBreakdown content = entry.getValue();
+		Path gradleBuildPath = Paths.get("project-tmp", "app", "build.gradle");
+		configureBuildGradle(gradleBuildPath, applicationId, classes, out);
 
-			File toCompile = new File(className.substring(className.lastIndexOf('.') + 1) + ".java");
-			File completePath = Paths.get("project-tmp", "app", "src", "main", "java",
-					className.substring(0, className.lastIndexOf('.')).replace(".", File.separator)).toFile();
-			completePath.mkdirs();
+		writeSources(Paths.get("project-tmp", "app", "src", "main", "java"), classes, out);
 
-			File newFile = new File(completePath, "ApkSpy_" + toCompile.getName());
-			Files.write(newFile.toPath(), content.toString().getBytes(StandardCharsets.UTF_8));
-
-			String simpleName = className.substring(className.lastIndexOf('.') + 1);
-			String newFileContent = new String(Files.readAllBytes(newFile.toPath()), StandardCharsets.UTF_8);
-			newFileContent = newFileContent.replaceAll("(class|interface|enum|@interface) +" + simpleName + "(.*)\\{",
-					"$1 ApkSpy_" + simpleName + "$2{");
-			newFileContent = newFileContent.replaceAll(simpleName + " *\\((.*)\\) *\\{",
-					"ApkSpy_" + simpleName + "($1) {");
-			Files.write(newFile.toPath(), newFileContent.getBytes(StandardCharsets.UTF_8));
-		}
-
-		Path stubPath = Paths.get(System.getProperty("java.io.tmpdir"), "apkSpy",
-				modifyingApk.getName().replace('.', '_') + "stub.jar");
-		if (!Files.exists(stubPath)) {
-			JarGenerator.generateStubJar(modifyingApk, stubPath.toFile(), out, classes);
-		}
+		Path stubPath = getStubJarPath(modifyingApk, classes);
+		ensureStubJar(modifyingApk, stubPath, out, classes);
 		Files.createDirectories(Paths.get("project-tmp", "app", "libs"));
 
 		if (!Files.exists(Paths.get("project-tmp", "app", "libs", "stub.jar"))) {
@@ -195,6 +409,7 @@ public class ApkSpy {
 			// couldn't be deleted before
 			Files.copy(stubPath, Paths.get("project-tmp", "app", "libs", "stub.jar"));
 		}
+		logStubJarDiagnostics(Paths.get("project-tmp", "app", "libs", "stub.jar"), classes.keySet(), out);
 
 		if (!Util.isWindows()) {
 			Runtime.getRuntime().exec("chmod +x project-tmp/gradlew").waitFor();
@@ -220,72 +435,92 @@ public class ApkSpy {
 				.collect(Collectors.toList());
 		List<Path> destinationFolders = smaliFolders.stream()
 				.map(path -> Paths.get(path.toString().replace("generated", "original"))).collect(Collectors.toList());
+		Map<Path, Path> generatedToOriginalRoots = mapGeneratedToOriginalRoots(smaliFolders);
+		Map<String, Path> generatedIndex = indexSmaliFiles(smaliFolders);
+		Map<String, Path> originalIndex = indexSmaliFiles(destinationFolders);
 
-		for (Path smaliFolder : smaliFolders) {
-			LOG.info("Searching through: {}", smaliFolder);
-			Files.walk(smaliFolder)
-					.filter(path -> Files.isRegularFile(path) && path.getFileName().toString().startsWith("ApkSpy_"))
-					.forEach(path -> {
-						try {
-							LOG.info("Merging smali file: {}", path);
-							Path equivalent = null;
-							for (Path otherFolder : destinationFolders) {
-								Path test = Paths.get(otherFolder.toString(),
-										path.toAbsolutePath().toString()
-												.substring(smaliFolder.toAbsolutePath().toString().length())
-												.replace("ApkSpy_", ""));
-								if (Files.isRegularFile(test)) {
-									equivalent = test;
-									break;
-								}
-							}
-							LOG.info("Merging into file: {}", equivalent);
+		for (Map.Entry<String, ClassBreakdown> classEntry : classes.entrySet()) {
+			String className = classEntry.getKey();
+			ClassBreakdown breakdown = classEntry.getValue();
+			Path generatedClassPath = generatedIndex.get(className);
 
-							String modifiedContent = new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
-							modifiedContent = modifiedContent.replace("ApkSpy_", "");
+			if (generatedClassPath == null) {
+				writeLine(out, "[ApkSpy] Could not locate generated smali for " + className);
+				continue;
+			}
 
-							if (equivalent != null) {
-								String originalContent = new String(Files.readAllBytes(equivalent),
-										StandardCharsets.UTF_8);
+			Path originalClassPath = originalIndex.get(className);
+			if (originalClassPath != null) {
+				LOG.info("Merging smali for class: {}", className);
 
-								SmaliBreakdown modifiedSmali = SmaliBreakdown.breakdown(modifiedContent);
+				String modifiedContent = Files.readString(generatedClassPath, StandardCharsets.UTF_8);
+				String originalContent = Files.readString(originalClassPath, StandardCharsets.UTF_8);
+				SmaliBreakdown modifiedSmali = SmaliBreakdown.breakdown(modifiedContent);
+				List<SmaliMethod> methods = modifiedSmali.getChangedMethods(breakdown);
 
-								ClassBreakdown relative = classes.get(modifiedSmali.getClassName());
+				writeLine(out, "[ApkSpy] Merging " + methods.size() + " method(s) for " + className);
+				StringBuilder builder = new StringBuilder(originalContent);
+				for (SmaliMethod method : methods) {
+					SmaliBreakdown originalSmali = SmaliBreakdown.breakdown(builder.toString());
+					SmaliMethod equivalentMethod = originalSmali.getEquivalentMethod(method);
+					if (equivalentMethod == null) {
+						writeLine(out, "[ApkSpy] Could not find matching original method for " + className + ": "
+								+ method.getContent().split("\n")[0]);
+						continue;
+					}
 
-								// check to make sure it's not an inner class
-								if (relative != null) {
-									LOG.info("Merging smali for class: {}", modifiedSmali.getClassName());
+					builder.delete(equivalentMethod.getStart(), equivalentMethod.getEnd());
+					builder.insert(equivalentMethod.getStart(), method.getContent());
+				}
 
-									List<SmaliMethod> methods = modifiedSmali.getChangedMethods(relative);
+				Files.writeString(originalClassPath, builder.toString(), StandardOpenOption.TRUNCATE_EXISTING,
+						StandardOpenOption.WRITE);
 
-									LOG.info("Originally changed methods: {}", relative.getChangedMethods().size());
-									LOG.info("Merging method count: {}", methods.size());
+				for (Map.Entry<String, Path> generatedClassEntry : generatedIndex.entrySet()) {
+					String generatedClassName = generatedClassEntry.getKey();
+					if (!isSyntheticNestedClass(className, generatedClassName)) {
+						continue;
+					}
 
-									StringBuilder builder = new StringBuilder(originalContent);
-									for (SmaliMethod method : methods) {
-										SmaliBreakdown originalSmali = SmaliBreakdown.breakdown(builder.toString());
-										SmaliMethod equivalentMethod = originalSmali.getEquivalentMethod(method);
+					Path sourcePath = generatedClassEntry.getValue();
+					Path generatedRoot = findRoot(sourcePath, generatedToOriginalRoots.keySet());
+					if (generatedRoot == null) {
+						continue;
+					}
 
-										builder.delete(equivalentMethod.getStart(), equivalentMethod.getEnd());
-										builder.insert(equivalentMethod.getStart(), method.getContent());
-									}
+					Path destinationRoot = generatedToOriginalRoots.get(generatedRoot);
+					Path destinationPath = destinationRoot.resolve(generatedRoot.relativize(sourcePath));
+					if (originalIndex.containsKey(generatedClassName)) {
+						writeLine(out, "[ApkSpy] Skipping nested class overwrite due to name collision: "
+								+ generatedClassName);
+						continue;
+					}
+					Files.createDirectories(destinationPath.getParent());
+					Files.copy(sourcePath, destinationPath, StandardCopyOption.REPLACE_EXISTING);
+					originalIndex.put(generatedClassName, destinationPath);
+				}
+				continue;
+			}
 
-									Files.write(equivalent, builder.toString().getBytes(StandardCharsets.UTF_8));
-								}
-							} else {
-								equivalent = Paths.get(smaliFolder.toString().replace("generated", "original"),
-										path.toAbsolutePath().toString()
-												.substring(smaliFolder.toAbsolutePath().toString().length())
-												.replace("ApkSpy_", ""));
-								Files.createDirectories(equivalent.getParent());
-								Files.writeString(equivalent, modifiedContent, StandardOpenOption.CREATE,
-										StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
-							}
-						} catch (IOException e) {
-							e.printStackTrace();
-							System.exit(1);
-						}
-					});
+			writeLine(out, "[ApkSpy] Copying added class: " + className);
+			for (Map.Entry<String, Path> generatedClassEntry : generatedIndex.entrySet()) {
+				String generatedClassName = generatedClassEntry.getKey();
+				if (!generatedClassName.equals(className) && !generatedClassName.startsWith(className + "$")) {
+					continue;
+				}
+
+				Path sourcePath = generatedClassEntry.getValue();
+				Path generatedRoot = findRoot(sourcePath, generatedToOriginalRoots.keySet());
+				if (generatedRoot == null) {
+					continue;
+				}
+
+				Path destinationRoot = generatedToOriginalRoots.get(generatedRoot);
+				Path destinationPath = destinationRoot.resolve(generatedRoot.relativize(sourcePath));
+				Files.createDirectories(destinationPath.getParent());
+				Files.copy(sourcePath, destinationPath, StandardCopyOption.REPLACE_EXISTING);
+				originalIndex.put(generatedClassName, destinationPath);
+			}
 		}
 
 		Set<String> deletions = ChangeCache.getInstance().getClassDeletions();
@@ -304,7 +539,7 @@ public class ApkSpy {
 		ApktoolWrapper.build(Paths.get("smali", "original"), apktoolLocation, jdkLocation, outputLocation, out);
 		Util.attemptDelete(new File("smali"));
 
-		Files.delete(stubPath);
+		Files.deleteIfExists(stubPath);
 
 		out.write("Finished creating APK!".getBytes(StandardCharsets.UTF_8));
 		return true;

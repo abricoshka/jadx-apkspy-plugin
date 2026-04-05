@@ -38,13 +38,32 @@ android {
                 'META-INF/NOTICE',
                 'META-INF/NOTICE.txt',
                 'META-INF/notice.txt',
-                'META-INF/ASL2.0'
+                'META-INF/ASL2.0',
+                'META-INF/*.version',
+                'META-INF/*.kotlin_module',
+                'META-INF/LGPL2.1'
             ]
         }
     }
 }
 
+tasks.withType(org.gradle.api.tasks.compile.JavaCompile).configureEach {
+    doFirst {
+        println "[ApkSpy] JavaCompile task: ${path}"
+        println "[ApkSpy] libs dir: ${file('libs').absolutePath}"
+        if (file('libs').exists()) {
+            file('libs').eachFile { lib ->
+                println "[ApkSpy] libs entry: ${lib.absolutePath}"
+            }
+        }
+        println "[ApkSpy] JavaCompile classpath:"
+        classpath.files.each { entry ->
+            println "[ApkSpy]   ${entry.absolutePath}"
+        }
+    }
+}
+
 dependencies {
-    implementation fileTree(dir: 'libs', include: ['*.jar'])
-    implementation 'androidx.appcompat:appcompat:1.7.1'
+    compileOnly fileTree(dir: 'libs', include: ['*.jar'])
+$APKSPY_DEPENDENCIES
 }
