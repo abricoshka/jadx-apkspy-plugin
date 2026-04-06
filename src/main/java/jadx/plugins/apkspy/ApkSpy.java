@@ -36,6 +36,7 @@ import org.apache.commons.io.FileUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import jadx.plugins.apkspy.ApkSpyOptions.SigningConfig;
 import jadx.plugins.apkspy.model.ChangeCache;
 import jadx.plugins.apkspy.model.ClassBreakdown;
 import jadx.plugins.apkspy.model.SmaliBreakdown;
@@ -96,7 +97,7 @@ public class ApkSpy {
 		return null;
 	}
 
-	private static void writeLine(OutputStream out, String message) throws IOException {
+	static void writeLine(OutputStream out, String message) throws IOException {
 		synchronized (out) {
 			out.write(message.getBytes(StandardCharsets.UTF_8));
 			out.write('\n');
@@ -813,10 +814,15 @@ public class ApkSpy {
 	}
 
 	public static boolean merge(String apk, String outputLocation, String sdkPath, String jdkLocation, String apktoolLocation,
-			String applicationId,
-			OutputStream out)
+			String applicationId, OutputStream out) throws IOException, InterruptedException {
+		return merge(apk, outputLocation, sdkPath, jdkLocation, apktoolLocation, applicationId, false, null, out);
+	}
+
+	public static boolean merge(String apk, String outputLocation, String sdkPath, String jdkLocation, String apktoolLocation,
+			String applicationId, boolean signOutput, SigningConfig signingConfig, OutputStream out)
 			throws IOException, InterruptedException {
-		sdkPath = sdkPath.replace("\\", "\\\\");
+		String rawSdkPath = sdkPath;
+		sdkPath = rawSdkPath.replace("\\", "\\\\");
 
 		LOG.info("Merging: {}", apk);
 		File modifyingApk = new File(apk);
@@ -1052,11 +1058,24 @@ public class ApkSpy {
 			}
 		}
 
-		writeLine(out, "[ApkSpy] before rebuild: smali/original using strategy " + rebuildStrategy.getId());
-		ApktoolWrapper.build(Paths.get("smali", "original"), apktoolLocation, jdkLocation, outputLocation, out);
-		Util.attemptDelete(new File("smali"));
-
-		Files.deleteIfExists(stubPath);
+		Path builtApkPath = Paths.get(outputLocation).toAbsolutePath();
+		try {
+			writeLine(out, "[ApkSpy] before rebuild: smali/original using strategy " + rebuildStrategy.getId());
+			ApktoolWrapper.build(Paths.get("smali", "original"), apktoolLocation, jdkLocation, outputLocation, out);
+			if (signOutput) {
+				writeLine(out, "[ApkSpy] before signing: " + builtApkPath);
+				ApkSignerWrapper.sign(builtApkPath, rawSdkPath, jdkLocation, signingConfig, out);
+			} else {
+				writeLine(out, "[ApkSpy] signing disabled; leaving unsigned APK");
+			}
+		} finally {
+			Util.attemptDelete(new File("smali"));
+			try {
+				Files.deleteIfExists(stubPath);
+			} catch (IOException e) {
+				LOG.warn("Could not delete temporary stub jar: {}", stubPath, e);
+			}
+		}
 
 		out.write("Finished creating APK!".getBytes(StandardCharsets.UTF_8));
 		return true;

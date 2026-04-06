@@ -10,6 +10,7 @@ import java.io.OutputStream;
 import java.nio.file.Paths;
 
 import javax.swing.JButton;
+import javax.swing.JCheckBox;
 import javax.swing.JDialog;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
@@ -25,6 +26,7 @@ import javax.swing.text.DefaultCaret;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import jadx.plugins.apkspy.ApkSignerWrapper;
 import jadx.api.JadxDecompiler;
 import jadx.plugins.apkspy.ApkSpy;
 import jadx.plugins.apkspy.ApkSpyOptions;
@@ -55,6 +57,9 @@ public class ApkSpySaver extends JDialog {
 			}
 		});
 		final JButton generate = new JButton("Save");
+		final JCheckBox sign = new JCheckBox("Sign", true);
+		final JButton signingOptions = new JButton("Signing options...");
+		signingOptions.addActionListener(e -> new SigningOptionsDialog(mainWindow, options).setVisible(true));
 		generate.addActionListener(new ActionListener() {
 			@Override
 			public void actionPerformed(ActionEvent e) {
@@ -74,11 +79,21 @@ public class ApkSpySaver extends JDialog {
 							"No changes have been made!", "apkSpy", JOptionPane.ERROR_MESSAGE);
 					return;
 				}
+				if (sign.isSelected()) {
+					String validationError = ApkSignerWrapper.validateSigningConfig(options.getAndroidSdkPath(),
+							options.getSigningConfig());
+					if (validationError != null) {
+						JOptionPane.showMessageDialog(mainWindow, validationError, "apkSpy", JOptionPane.ERROR_MESSAGE);
+						return;
+					}
+				}
 
 				cancel.setEnabled(false);
 				generate.setEnabled(false);
 
 				output.setText("");
+				final boolean signOutput = sign.isSelected();
+				final ApkSpyOptions.SigningConfig signingConfig = options.getSigningConfig();
 
 				Thread thread = new Thread(new Runnable() {
 					@Override
@@ -86,7 +101,7 @@ public class ApkSpySaver extends JDialog {
 						try {
 							boolean success = ApkSpy.merge(inputApkFilename,
 									saveLocation.getText(), options.getAndroidSdkPath(), options.getJdkLocation(),
-									options.getApktoolLocation(), "jadx", new OutputStream() {
+									options.getApktoolLocation(), "jadx", signOutput, signingConfig, new OutputStream() {
 										@Override
 										public void write(int b) throws IOException {
 											System.out.print((char) b);
@@ -123,6 +138,8 @@ public class ApkSpySaver extends JDialog {
 		JPanel buttons = new JPanel();
 		buttons.add(new JLabel("Save As: "));
 		buttons.add(saveLocation);
+		buttons.add(sign);
+		buttons.add(signingOptions);
 		buttons.add(generate);
 		buttons.add(cancel);
 
